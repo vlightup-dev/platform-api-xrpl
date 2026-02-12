@@ -125,7 +125,7 @@ Before any escrow can be released, the server enforces:
 
 ---
 
-## File Structure
+## File Structure (This repo includes server files related to just XRPL for submission)
 
 ```
 platform-api-xrpl/
