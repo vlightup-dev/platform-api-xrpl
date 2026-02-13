@@ -459,12 +459,10 @@ def register_escrow_routes(app) -> None:
         raw = data.get("signer_addresses")
         signer_addresses = [str(s).strip() for s in (raw if isinstance(raw, list) else []) if s]
         signer_quorum = data.get("signer_quorum")
-        if signer_quorum is None:
-            return build_error_geoauth_response(request, "Invalid signer_quorum")
         try:
             signer_quorum = int(signer_quorum)
         except (TypeError, ValueError):
-            signer_quorum = 2
+            return build_error_geoauth_response(request, "Invalid signer_quorum")
         return build_success_geoauth_response(request, data={"signer_addresses": signer_addresses, "signer_quorum": signer_quorum})
 
     @app.post("/api/v1/xrpl/escrow/request-release")
@@ -565,9 +563,11 @@ def register_escrow_routes(app) -> None:
         existing = existing_doc.to_dict() if existing_doc.exists else {}
         existing_awaiting = existing.get("awaiting_signer_addresses")
         if isinstance(existing_awaiting, list) and existing_awaiting:
-            raw_all = existing.get("signer_addresses") or existing_awaiting
-            all_signers = [str(s).strip() for s in (raw_all if isinstance(raw_all, list) else []) if s] if raw_all else [str(s).strip() for s in existing_awaiting if s]
-            # Remove signer 1 (just signed) and multisig account from awaiting.
+            all_signers = existing.get("signer_addresses") or existing_awaiting
+            if not isinstance(all_signers, list):
+                all_signers = [str(s).strip() for s in existing_awaiting if s]
+            else:
+                all_signers = [str(s).strip() for s in all_signers if s]
             awaiting_signer_addresses = [
                 s for s in existing_awaiting
                 if s and str(s).strip().lower() != signer_1_lower and str(s).strip().lower() != account_lower
@@ -579,12 +579,6 @@ def register_escrow_routes(app) -> None:
                 return build_error_geoauth_response(request, "Invalid signer_quorum")
         else:
             return build_error_geoauth_response(request, "Could not determine awaiting signers: set multisig_config via register-multisig or call prepare with owner for multisig")
-        # First signature must be from configured signer 1 (first in signer_addresses).
-        if all_signers and signer_1_lower != (all_signers[0].strip().lower() if all_signers[0] else ""):
-            return build_error_geoauth_response(
-                request,
-                "The first signature must be from signer 1 (the signer created in Configure multi-sig). Use the signer 1 wallet to initiate the escrow.",
-            )
         if not awaiting_signer_addresses and all_signers:
             awaiting_signer_addresses = [
                 s for s in all_signers
@@ -801,9 +795,9 @@ def register_escrow_routes(app) -> None:
         awaiting_next = [a for a in all_signer_addresses if a and a not in collected]
         signer_quorum = bundle.get("signer_quorum")
         try:
-            signer_quorum = int(signer_quorum) if signer_quorum is not None else 2
+            signer_quorum = int(signer_quorum)
         except (TypeError, ValueError):
-            signer_quorum = 2
+            return build_error_geoauth_response(request, "Invalid signer_quorum")
         try:
             db.collection("pending_escrow_bundles").document(pending_id).set({
                 "escrow_create_tx_json": create_tx,
@@ -869,12 +863,10 @@ def register_escrow_routes(app) -> None:
 
         signer_1_address = (bundle.get("signer_1_address") or "").strip()
         signer_quorum = bundle.get("signer_quorum")
-        if signer_quorum is None:
-            signer_quorum = 2
         try:
             signer_quorum = int(signer_quorum)
         except (TypeError, ValueError):
-            signer_quorum = 2
+            return build_error_geoauth_response(request, "Invalid signer_quorum")
         signers_create = _signer_addresses_from_tx(create_tx)
         signers_finish = _signer_addresses_from_tx(finish_tx)
         if len(signers_create) < signer_quorum or len(signers_finish) < signer_quorum:
@@ -885,16 +877,6 @@ def register_escrow_routes(app) -> None:
 
         if signer_1_address and signer_1_address not in signers_create:
             return build_error_geoauth_response(request, "First signer must be one of the signers")
-
-        owner = (create_tx.get("Account") or bundle.get("owner") or "").strip()
-        owner_lower = owner.lower() if owner else ""
-        for addr in signers_create + signers_finish:
-            if addr and addr.strip().lower() == owner_lower:
-                return build_error_geoauth_response(
-                    request,
-                    "The transaction includes a signature from the multisig (main) account, which cannot be a signer. "
-                    "Sign with a co-signer wallet (e.g. signer 2 or 3), not the main account.",
-                )
 
         # Log full tx_json for both Create and Finish before submitting
         logger.info(
