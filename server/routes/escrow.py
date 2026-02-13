@@ -205,7 +205,7 @@ def register_escrow_routes(app) -> None:
             logger.exception("Failed to store escrow fulfillment in Redis, destination=%s, error=%s", result.get("destination"), str(e))
             return build_exception_geoauth_response(request, e, "Failed to prepare escrow")
 
-        user_id, _ = _get_user_id_and_wallet_from_request(request)
+        user_id, wallet_address = _get_user_id_and_wallet_from_request(request)
         now_prepare = datetime.now(timezone.utc)
         expires_at_prepare = now_prepare + timedelta(seconds=cancel_sec)
         escrow_doc = {
@@ -222,11 +222,31 @@ def register_escrow_routes(app) -> None:
             escrow_doc["finish_after"] = result["finish_after"]
         if user_id:
             escrow_doc["user_id"] = user_id
+        # For multisig: set signer_addresses and awaiting_signer_addresses from multisig_config (owner = multisig account).
+        owner_prepare = (body.get("owner") or body.get("multisig_account") or (wallet_address or "")).strip()
+        if owner_prepare:
+            multisig_doc = db.collection("multisig_config").document(owner_prepare).get()
+            if multisig_doc.exists:
+                multisig_data = multisig_doc.to_dict() or {}
+                raw_signers = multisig_data.get("signer_addresses")
+                signer_addresses_prepare = [str(s).strip() for s in (raw_signers if isinstance(raw_signers, list) else []) if s]
+                quorum_prepare = multisig_data.get("signer_quorum")
+                try:
+                    quorum_prepare = int(quorum_prepare)
+                except (TypeError, ValueError):
+                    return build_error_geoauth_response(request, "Invalid signer_quorum")
+                if signer_addresses_prepare:
+                    owner_lower = owner_prepare.strip().lower()
+                    # Awaiting = all signers except the multisig account (no one has signed yet).
+                    awaiting_prepare = [s for s in signer_addresses_prepare if s and s.strip().lower() != owner_lower]
+                    escrow_doc["owner"] = owner_prepare
+                    escrow_doc["signer_addresses"] = signer_addresses_prepare
+                    escrow_doc["signer_quorum"] = quorum_prepare
+                    escrow_doc["awaiting_signer_addresses"] = awaiting_prepare
         try:
             db.collection("pending_escrow_bundles").document(condition_hex).set(escrow_doc, merge=True)
         except Exception as e:
-            logger.exception("Failed to store escrow state in Firestore: %s", e)
-            # non-fatal: Redis is source of truth for finish; Firestore is for audit
+            logger.error("Failed to store escrow state in Firestore: %s", e)
 
         payload = {
             "condition": condition_hex,
@@ -356,10 +376,9 @@ def register_escrow_routes(app) -> None:
     @jwt_required
     async def register_multisig(request: Request) -> Response:
         """
-        Store multisig config (multisig account -> signer addresses) for use when creating pending bundles.
-        Multisig account is the authenticated user's linked wallet from the user doc (no client-supplied account).
-        Body: signer1_wallet_address, signer2_wallet_address, signer3_wallet_address (optional).
-        Stored as signer_addresses and used to build awaiting_signer_addresses when creating bundles.
+        Store multisig config (multisig account -> signer addresses and quorum) for M-of-N multi-sig.
+        Body: signer_addresses (array of N addresses) and signer_quorum (M, default 2).
+        Legacy: signer1_wallet_address, signer2_wallet_address, signer3_wallet_address (optional) are still accepted.
         """
         try:
             body = request.json()
@@ -376,28 +395,45 @@ def register_escrow_routes(app) -> None:
             return build_error_geoauth_response(request, "No XRPL wallet linked. Register SBT with your wallet first.")
         account = wallet_address
         wallet_log = f"{wallet_address[:6]}...{wallet_address[-4:]}" if len(wallet_address) > 12 else "***"
-        s1 = (body.get("signer1_wallet_address") or body.get("signer1WalletAddress") or "").strip()
-        s2 = (body.get("signer2_wallet_address") or body.get("signer2WalletAddress") or "").strip()
-        s3 = (body.get("signer3_wallet_address") or body.get("signer3WalletAddress") or "").strip()
-        signer_list = [s1, s2, s3]
-        signer_list = [a for a in signer_list if a]
+
+        signer_addresses_raw = body.get("signer_addresses") or body.get("signerAddresses")
+        if isinstance(signer_addresses_raw, list) and signer_addresses_raw:
+            signer_list = [str(s).strip() for s in signer_addresses_raw if s]
+        elif isinstance(signer_addresses_raw, str) and signer_addresses_raw.strip():
+            try:
+                parsed = json.loads(signer_addresses_raw)
+                signer_list = [str(s).strip() for s in (parsed if isinstance(parsed, list) else []) if s]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                signer_list = []
+        
         if not signer_list:
-            logger.error("register-multisig: No signer addresses provided (signer1/2/3_wallet_address) for user_id=%s", user_id)
-            return build_error_geoauth_response(request, "Provide at least signer1_wallet_address and signer2_wallet_address")
+            return build_error_geoauth_response(request, "Provide signer_addresses (array) or signer1_wallet_address and signer2_wallet_address")
+
+        quorum_raw = body.get("signer_quorum") or body.get("signerQuorum")
+        if quorum_raw is None:
+            return build_error_geoauth_response(request, "Missing required field: signer_quorum")
+        try:
+            signer_quorum = int(quorum_raw)
+        except (TypeError, ValueError):
+            signer_quorum = 2
+        if signer_quorum < 1 or signer_quorum > len(signer_list):
+            return build_error_geoauth_response(request, "signer_quorum must be between 1 and the number of signers")
+
         logger.info(
-            "register-multisig: user_id=%s account=%s signer_count=%d",
-            user_id, wallet_log, len(signer_list),
+            "register-multisig: user_id=%s account=%s signer_count=%d quorum=%d",
+            user_id, wallet_log, len(signer_list), signer_quorum,
         )
         try:
             db.collection("multisig_config").document(account).set({
                 "signer_addresses": signer_list,
+                "signer_quorum": signer_quorum,
                 "updated_at": firestore.SERVER_TIMESTAMP,
             }, merge=True)
         except Exception as e:
             logger.exception("Failed to store multisig_config: %s", e)
             return build_exception_geoauth_response(request, e, "Failed to store multisig config")
         logger.info("register-multisig: success for account=%s", wallet_log)
-        return build_success_geoauth_response(request, data={"status": "ok", "account": account})
+        return build_success_geoauth_response(request, data={"status": "ok", "account": account, "signer_quorum": signer_quorum})
 
     @app.get("/api/v1/xrpl/escrow/multisig-signers")
     @jwt_required
@@ -418,10 +454,18 @@ def register_escrow_routes(app) -> None:
             logger.exception("multisig-signers: failed to read doc: %s", e)
             return build_exception_geoauth_response(request, e, "Failed to get multisig signers")
         if not multisig_doc.exists:
-            return build_success_geoauth_response(request, data={"signer_addresses": []})
-        raw = (multisig_doc.to_dict() or {}).get("signer_addresses")
+            return build_success_geoauth_response(request, data={"signer_addresses": [], "signer_quorum": 2})
+        data = multisig_doc.to_dict() or {}
+        raw = data.get("signer_addresses")
         signer_addresses = [str(s).strip() for s in (raw if isinstance(raw, list) else []) if s]
-        return build_success_geoauth_response(request, data={"signer_addresses": signer_addresses})
+        signer_quorum = data.get("signer_quorum")
+        if signer_quorum is None:
+            return build_error_geoauth_response(request, "Invalid signer_quorum")
+        try:
+            signer_quorum = int(signer_quorum)
+        except (TypeError, ValueError):
+            signer_quorum = 2
+        return build_success_geoauth_response(request, data={"signer_addresses": signer_addresses, "signer_quorum": signer_quorum})
 
     @app.post("/api/v1/xrpl/escrow/request-release")
     @jwt_required
@@ -513,27 +557,49 @@ def register_escrow_routes(app) -> None:
         destination = (redis_client.get(dest_key) or "").strip()
         amount_drops = create_tx.get("Amount") or create_tx.get("amount_drops") or ""
 
-        signer_1_address = signers_create[0] if signers_create else (signers_finish[0] if signers_finish else "")
-        # Resolve full signer list: from multisig_config or optional body fallback. Use only if list (never iterate string).
-        signer_addresses = body.get("signer_addresses") or body.get("signerAddresses")
-        if isinstance(signer_addresses, list) and signer_addresses:
-            all_signers = [str(s).strip() for s in signer_addresses if s]
+        signer_1_address = (signers_create[0] if signers_create else (signers_finish[0] if signers_finish else "")).strip()
+        account_lower = account.strip().lower()
+        signer_1_lower = signer_1_address.lower() if signer_1_address else ""
+        # Use awaiting_signer_addresses from prepare (set from multisig_config); remove first signer who just signed.
+        existing_doc = db.collection("pending_escrow_bundles").document(condition_hex).get()
+        existing = existing_doc.to_dict() if existing_doc.exists else {}
+        existing_awaiting = existing.get("awaiting_signer_addresses")
+        if isinstance(existing_awaiting, list) and existing_awaiting:
+            raw_all = existing.get("signer_addresses") or existing_awaiting
+            all_signers = [str(s).strip() for s in (raw_all if isinstance(raw_all, list) else []) if s] if raw_all else [str(s).strip() for s in existing_awaiting if s]
+            # Remove signer 1 (just signed) and multisig account from awaiting.
+            awaiting_signer_addresses = [
+                s for s in existing_awaiting
+                if s and str(s).strip().lower() != signer_1_lower and str(s).strip().lower() != account_lower
+            ]
+            signer_quorum = existing.get("signer_quorum")
+            try:
+                signer_quorum = int(signer_quorum)
+            except (TypeError, ValueError):
+                return build_error_geoauth_response(request, "Invalid signer_quorum")
         else:
-            multisig_doc = db.collection("multisig_config").document(account).get()
-            raw = (multisig_doc.to_dict() or {}).get("signer_addresses") if multisig_doc.exists else None
-            all_signers = [str(s).strip() for s in (raw if isinstance(raw, list) else []) if s]
-        awaiting_signer_addresses = [s for s in all_signers if s and s != signer_1_address]
+            return build_error_geoauth_response(request, "Could not determine awaiting signers: set multisig_config via register-multisig or call prepare with owner for multisig")
+        # First signature must be from configured signer 1 (first in signer_addresses).
+        if all_signers and signer_1_lower != (all_signers[0].strip().lower() if all_signers[0] else ""):
+            return build_error_geoauth_response(
+                request,
+                "The first signature must be from signer 1 (the signer created in Configure multi-sig). Use the signer 1 wallet to initiate the escrow.",
+            )
         if not awaiting_signer_addresses and all_signers:
-            awaiting_signer_addresses = [s for s in all_signers if s]
-            awaiting_signer_addresses = [s for s in awaiting_signer_addresses if s != signer_1_address]
+            awaiting_signer_addresses = [
+                s for s in all_signers
+                if s and s.strip().lower() != signer_1_lower and s.strip().lower() != account_lower
+            ]
         if not awaiting_signer_addresses:
-            return build_error_geoauth_response(request, "Could not determine awaiting signers: set multisig_config via register-multisig or send signer_addresses in body")
+            return build_error_geoauth_response(request, "Could not determine awaiting signers: set multisig_config via register-multisig or call prepare with owner for multisig")
 
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(seconds=BUNDLE_TTL_SEC)
         bundle_data = {
             "state": "pending_signatures",
+            "signer_quorum": signer_quorum,
             "signer_1_address": signer_1_address,
+            "signer_addresses": all_signers,
             "awaiting_signer_addresses": awaiting_signer_addresses,
             "destination": destination,
             "amount_drops": str(amount_drops),
@@ -584,13 +650,21 @@ def register_escrow_routes(app) -> None:
                         continue
                 create_tx = data.get("escrow_create_tx_json") or {}
                 owner = (create_tx.get("Account") or "").strip()
+                signer_quorum = data.get("signer_quorum")
+                if signer_quorum is None:
+                    return build_error_geoauth_response(request, "Invalid signer_quorum")
+                try:
+                    signer_quorum = int(signer_quorum)
+                except (TypeError, ValueError):
+                    return build_error_geoauth_response(request, "Invalid signer_quorum")
                 pending.append({
                     "pending_id": doc.id,
                     "condition": doc.id,
                     "owner": owner,
                     "destination": data.get("destination", ""),
                     "amount_drops": data.get("amount_drops", ""),
-                    "signer_addresses": [data.get("signer_1_address")] if data.get("signer_1_address") else [],
+                    "signer_quorum": signer_quorum,
+                    "signer_addresses": data.get("signer_addresses"),
                 })
         except Exception as e:
             logger.exception("pending-releases: Firestore query failed: %s", e)
@@ -645,22 +719,114 @@ def register_escrow_routes(app) -> None:
         signer_2_address = wallet_address
         signer_1_address = (bundle.get("signer_1_address") or "").strip()
         if signer_2_address == signer_1_address:
-            return build_error_geoauth_response(request, "Second signer must be different from first signer")
+            return build_error_geoauth_response(request, "You cannot sign again as the first signer; use a different co-signer wallet.")
         raw = bundle.get("awaiting_signer_addresses") or []
         awaiting = [str(a).strip() for a in (raw if isinstance(raw, list) else []) if a]
         if signer_2_address not in awaiting:
             return build_unauthorized_geoauth_response(request, "This pending release is not for your linked wallet")
 
+        signer_quorum = bundle.get("signer_quorum")
+        if signer_quorum is None:
+            return build_error_geoauth_response(request, "signer_quorum should be set in the bundle")
+        try:
+            signer_quorum = int(signer_quorum)
+        except (TypeError, ValueError):
+            return build_error_geoauth_response(request, "Invalid signer_quorum")
         return build_success_geoauth_response(request, data={
             "escrow_create_tx_json": bundle.get("escrow_create_tx_json"),
             "escrow_finish_tx_json": bundle.get("escrow_finish_tx_json"),
+            "signer_quorum": signer_quorum,
+        })
+
+    @app.post("/api/v1/xrpl/escrow/submit-additional-signatures")
+    @jwt_required
+    async def submit_additional_signatures(request: Request) -> Response:
+        """
+        M-of-N: a co-signer adds their signature to the bundle without submitting to XRPL.
+        Use when current signature count + 1 < signer_quorum. When you have M signatures, call complete-release.
+        Body: pending_id, digital_id, timestamp, nonce, location_signature, escrow_create_tx_json, escrow_finish_tx_json.
+        """
+        body, err_resp = _request_body_dict(request)
+        if err_resp is not None:
+            return err_resp
+        if not body:
+            return build_error_geoauth_response(request, "Empty request body")
+        user_id, wallet_address = _get_user_id_and_wallet_from_request(request)
+        if not user_id:
+            return build_error_geoauth_response(request, "User identity not found")
+        if not wallet_address:
+            return build_error_geoauth_response(request, "No XRPL wallet linked. Register SBT with your wallet first.")
+        pending_id = (body.get("pending_id") or body.get("condition") or "").strip().upper()
+        if not pending_id:
+            return build_error_geoauth_response(request, "Missing required field: pending_id or condition")
+        if not body.get("condition"):
+            body = {**body, "condition": pending_id}
+        condition_hex, err_resp = _parse_location_body(request, body, require_owner=False)
+        if err_resp is not None:
+            return err_resp
+        if condition_hex != pending_id:
+            return build_error_geoauth_response(request, "pending_id must match condition")
+        create_tx = _ensure_tx_dict(body.get("escrow_create_tx_json"))
+        finish_tx = _ensure_tx_dict(body.get("escrow_finish_tx_json"))
+        if not create_tx or not finish_tx:
+            return build_error_geoauth_response(request, "Missing or invalid escrow_create_tx_json or escrow_finish_tx_json")
+        bundle_doc = db.collection("pending_escrow_bundles").document(pending_id).get()
+        if not bundle_doc.exists:
+            return build_error_geoauth_response(request, "Pending release not found or expired")
+        bundle = bundle_doc.to_dict() or {}
+        if bundle.get("state") != "pending_signatures":
+            return build_error_geoauth_response(request, "Pending release not found or already completed")
+        raw = bundle.get("awaiting_signer_addresses") or []
+        awaiting = [str(a).strip() for a in (raw if isinstance(raw, list) else []) if a]
+        if wallet_address not in awaiting:
+            return build_unauthorized_geoauth_response(request, "This pending release is not for your linked wallet or you have already signed")
+        # Check the *stored* bundle: if caller already signed, reject duplicate. (Incoming payload includes their new sig.)
+        stored_create = bundle.get("escrow_create_tx_json") or {}
+        stored_finish = bundle.get("escrow_finish_tx_json") or {}
+        stored_signers_create = _signer_addresses_from_tx(stored_create)
+        stored_signers_finish = _signer_addresses_from_tx(stored_finish)
+        wallet_lower = wallet_address.strip().lower()
+        if any(s and s.strip().lower() == wallet_lower for s in stored_signers_create) or any(
+            s and s.strip().lower() == wallet_lower for s in stored_signers_finish
+        ):
+            return build_error_geoauth_response(request, "Your signature is already in the bundle")
+        signers_create = _signer_addresses_from_tx(create_tx)
+        signers_finish = _signer_addresses_from_tx(finish_tx)
+        if len(signers_create) < 1 or len(signers_finish) < 1:
+            return build_error_geoauth_response(request, "Bundle must contain at least one existing signature")
+        all_signer_addresses = bundle.get("signer_addresses") or []
+        if not isinstance(all_signer_addresses, list):
+            all_signer_addresses = []
+        collected = list(set(signers_create) | set(signers_finish))
+        awaiting_next = [a for a in all_signer_addresses if a and a not in collected]
+        signer_quorum = bundle.get("signer_quorum")
+        try:
+            signer_quorum = int(signer_quorum) if signer_quorum is not None else 2
+        except (TypeError, ValueError):
+            signer_quorum = 2
+        try:
+            db.collection("pending_escrow_bundles").document(pending_id).set({
+                "escrow_create_tx_json": create_tx,
+                "escrow_finish_tx_json": finish_tx,
+                "awaiting_signer_addresses": awaiting_next,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+        except Exception as e:
+            logger.exception("submit-additional-signatures: Failed to update bundle: %s", e)
+            return build_exception_geoauth_response(request, e, "Failed to store additional signatures")
+        quorum_reached = len(signers_create) >= signer_quorum and len(signers_finish) >= signer_quorum
+        return build_success_geoauth_response(request, data={
+            "status": "additional_signatures_stored",
+            "signature_count": len(signers_create),
+            "signer_quorum": signer_quorum,
+            "quorum_reached": quorum_reached,
         })
 
     @app.post("/api/v1/xrpl/escrow/complete-release")
     @jwt_required
     async def complete_release(request: Request) -> Response:
         """
-        Multi-sig Signer 2: validate location again, then submit EscrowCreate then EscrowFinish (both 2-of-2).
+        M-of-N: submit EscrowCreate then EscrowFinish when bundle has at least signer_quorum signatures.
         Body: pending_id, digital_id, timestamp, nonce, location_signature, escrow_create_tx_json, escrow_finish_tx_json.
         """
         logger.info("complete_release: request received")
@@ -702,13 +868,33 @@ def register_escrow_routes(app) -> None:
             return build_error_geoauth_response(request, "Pending release not found or already completed")
 
         signer_1_address = (bundle.get("signer_1_address") or "").strip()
+        signer_quorum = bundle.get("signer_quorum")
+        if signer_quorum is None:
+            signer_quorum = 2
+        try:
+            signer_quorum = int(signer_quorum)
+        except (TypeError, ValueError):
+            signer_quorum = 2
         signers_create = _signer_addresses_from_tx(create_tx)
         signers_finish = _signer_addresses_from_tx(finish_tx)
-        if len(signers_create) < 2 or len(signers_finish) < 2:
-            return build_error_geoauth_response(request, "Both txs must have two signatures")
+        if len(signers_create) < signer_quorum or len(signers_finish) < signer_quorum:
+            return build_error_geoauth_response(
+                request,
+                f"Both txs must have at least {signer_quorum} signature(s) (M-of-N multi-sig). Got {len(signers_create)} and {len(signers_finish)}.",
+            )
 
         if signer_1_address and signer_1_address not in signers_create:
             return build_error_geoauth_response(request, "First signer must be one of the signers")
+
+        owner = (create_tx.get("Account") or bundle.get("owner") or "").strip()
+        owner_lower = owner.lower() if owner else ""
+        for addr in signers_create + signers_finish:
+            if addr and addr.strip().lower() == owner_lower:
+                return build_error_geoauth_response(
+                    request,
+                    "The transaction includes a signature from the multisig (main) account, which cannot be a signer. "
+                    "Sign with a co-signer wallet (e.g. signer 2 or 3), not the main account.",
+                )
 
         # Log full tx_json for both Create and Finish before submitting
         logger.info(
